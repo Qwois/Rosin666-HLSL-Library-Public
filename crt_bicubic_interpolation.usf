@@ -1,0 +1,181 @@
+// Beta Version / Spectral Project
+//      .+------+ 
+//    .' |    .'| 
+//   +---+--+'  | 
+//   |   |  |   | 
+//   |  ,+--+---+ 
+//   |.'    | .'  
+//   +------+'    
+// By Rosin666
+
+
+struct CRTShader
+{
+    Texture2D noiseTex;
+    SamplerState noiseSampler;
+    float iTime;
+    float vigAmount;
+    float stripeWaveEnabled;
+    float stripeWaveAmount;
+
+    float4 cubicWeights(float x)
+    {
+        float x2 = x * x;
+        float x3 = x2 * x;
+
+        return float4(
+            -0.5 * x + x2 - 0.5 * x3,
+            1.0 - 2.5 * x2 + 1.5 * x3,
+            0.5 * x + 2.0 * x2 - 1.5 * x3,
+            -0.5 * x2 + 0.5 * x3
+        );
+    }
+
+    float3 bicubicSample(float2 uv)
+    {
+        const int SceneTextureIndex = 14;
+
+        float2 texelSize = GetSceneTextureBufferSize(SceneTextureIndex).zw;
+        float2 pixel = uv / texelSize - 0.5;
+
+        float2 pixelBase = floor(pixel);
+        float2 fraction = frac(pixel);
+
+        float4 weightsX = cubicWeights(fraction.x);
+        float4 weightsY = cubicWeights(fraction.y);
+
+        float4 uvBounds = GetSceneTextureUVMinMax(SceneTextureIndex);
+
+        float3 result = 0.0;
+
+        [unroll]
+        for (int y = 0; y < 4; ++y)
+        {
+            [unroll]
+            for (int x = 0; x < 4; ++x)
+            {
+                float2 samplePixel = pixelBase + float2(x - 1, y - 1) + 0.5;
+                float2 sampleUV = samplePixel * texelSize;
+                sampleUV = clamp(sampleUV, uvBounds.xy, uvBounds.zw);
+
+                float3 sampleColor = SceneTextureLookup(
+                    sampleUV,
+                    SceneTextureIndex,
+                    false
+                ).rgb;
+
+                float weight = weightsX[x] * weightsY[y];
+                result += sampleColor * weight;
+            }
+        }
+
+        return result;
+    }
+
+    float noise(float2 p)
+    {
+        float2 uv = float2(1.0, 2.0 * cos(iTime)) * iTime * 12.0 + p;
+        float s = noiseTex.SampleLevel(noiseSampler, uv, 0).x;
+        return s * s;
+    }
+
+    float onOff(float a, float b, float c)
+    {
+        return step(c, sin(iTime + a * cos(iTime * b)));
+    }
+
+    float ramp(float y, float start, float end)
+    {
+        float inside = step(start, y) - step(end, y);
+        float fact = (y - start) / (end - start) * inside;
+        return (1.0 - fact) * inside;
+    }
+
+    float3 stripes(float2 uv)
+    {
+        float noi = noise(uv * float2(0.5, 2.0) + float2(1.0, 3.0));
+        float fineNoi = noise(uv * float2(2.0, 15.0) - float2(iTime * 5.0, 0.0));
+
+        float band1 = ramp(
+            fmod(uv.y * 3.0 + iTime * 0.6 + sin(iTime * 1.2), 1.0),
+            0.45,
+            0.62
+        ) * noi;
+
+        float band2 = ramp(
+            fmod(uv.y * 7.0 - iTime * 1.8, 1.0),
+            0.85,
+            0.90
+        ) * fineNoi * 1.8;
+
+        float3 stripeColor = float3(
+            band1 + band2,
+            (band1 + band2) * 0.85,
+            (band1 + band2) * 1.15
+        );
+
+        return stripeColor * 1.4;
+    }
+
+    float2 screenDistort(float2 uv)
+    {
+        uv -= 0.5;
+        uv = uv * 1.2 * (1.0 / 1.2 + 2.0 * uv.x * uv.x * uv.y * uv.y);
+        uv += 0.5;
+        return uv;
+    }
+
+    float3 mainImage(float2 uv)
+    {
+        uv = screenDistort(uv);
+        float2 sceneUV = ViewportUVToSceneTextureUV(uv, 14);
+        float3 video = bicubicSample(sceneUV);
+
+        float glitchPulse = onOff(3.0, 5.0, 0.75);
+        float shiftAmount = 0.015 * glitchPulse * sin(uv.y * 40.0 + iTime * 30.0);
+
+        video.r = lerp(video.r, video.r + shiftAmount * 4.0, glitchPulse);
+        video.b = lerp(video.b, video.b - shiftAmount * 4.0, glitchPulse);
+
+        float vigAmt = vigAmount;
+            
+        float vignette =
+            (1.0 - vigAmt * (uv.y - 0.5) * (uv.y - 0.5)) *
+            (1.0 - vigAmt * (uv.x - 0.5) * (uv.x - 0.5));
+
+        video += stripes(uv) * stripeWaveEnabled * stripeWaveAmount;
+        video += noise(uv * 3.5) * 0.65;
+
+        float sparkLine = step(
+            0.992,
+            frac(
+                sin(
+                    floor(uv.y * 120.0) * 91.7 +
+                    floor(iTime * 24.0) * 17.3
+                ) * 43758.5
+            )
+        );
+
+        float sparkMask = noise(float2(uv.x * 4.0, iTime * 10.0));
+        video += sparkLine * step(0.35, sparkMask) * 0.85;
+
+        video *= saturate(vignette);
+
+        float fineScanline = 0.85 + 0.15 * sin(uv.y * 450.0 + iTime * 10.0);
+        float slowBar = (10.0 + fmod(uv.y * 25.0 + iTime * 1.5, 1.0)) / 11.0;
+
+        video *= fineScanline * slowBar;
+
+        return video;
+    }
+};
+
+CRTShader crt;
+crt.noiseTex = NoiseTex;
+crt.noiseSampler = NoiseTexSampler;
+crt.iTime = Time;
+crt.vigAmount = VigAmount;
+crt.stripeWaveEnabled = StripeWaveEnabled;
+crt.stripeWaveAmount = StripeWaveAmount;
+
+return crt.mainImage(UV);
